@@ -511,7 +511,7 @@ class DockerTree:
         """Print infos for given images dict."""
         images, max_depth, max_tag_length = self.build_tree(4)
         colors = ColorTheme()
-        if os.getenv('USECOLOR', 'no')[:1].lower() not in ('y', '1'):
+        if os.getenv('USECOLOR', '1')[:1].lower() not in ('y', '1'):
             colors.disable_colors()
         head_lines = []
         self._add_line(head_lines, None, '', '   ', 'Image Id', 'Size', 'Net', 'Tags', 'Containers',
