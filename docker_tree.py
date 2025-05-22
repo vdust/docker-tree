@@ -95,16 +95,51 @@ class ContainerInfos:
 class ImageInfos:
     """Image informations."""
     id: str | None = None
-    size: str | None = None
+    size: int | None = None
     tags: set[str] = dataclasses.field(default_factory=set)
     containers: list[str] = dataclasses.field(default_factory=list)
     layers: list[str] = dataclasses.field(default_factory=list)
     children: dict[str, 'ImageInfos'] | None = None
 
+    _human_bytes_units: ClassVar[list[str]] = ['B', 'kB', 'MB', 'GB', 'TB', 'PB']
+
     @property
-    def first_tag(self):
+    def first_tag(self) -> str | None:
         """Get first tag in lexicographic order."""
         return None if not self.tags else min(self.tags)
+
+    def sorted_tags(self, reverse: bool = False) -> list[str]:
+        """Return a list of tags, sorted by (name, version) tuple."""
+        return sorted(self.tags, key=lambda tag: tag.split(':'), reverse=reverse)
+
+    @property
+    def sort_size(self) -> str:
+        """Get the size of the largest image, children included."""
+        size = self.size
+        if self.children:
+            for child in self.children.values():
+                c_size = child.sort_size
+                if c_size > size:
+                    size = c_size
+        return size
+
+    @property
+    def human_size(self) -> str:
+        """Convert image size to human-readable value."""
+        scale = 0
+        size = self.size if self.size is not None else -1
+        while size > 1000:
+            scale += 1
+            size = size / 1000.0
+        if size < 0 or scale >= len(self._human_bytes_units):
+            return '???'
+        unit = self._human_bytes_units[scale]
+        if size >= 100:
+            return f"{int(size)}{unit}"
+        elif size >= 10:
+            return f"{size:.01f}{unit}"
+        else:
+            return f"{size:.02f}{unit}"
 
 
 @dataclasses.dataclass
@@ -190,6 +225,17 @@ class DockerCli(Docker):
     """
 
     docker_exec: list[str] = ['docker']
+    sizes_scales: tuple[str] = ('B', 'KB', 'MB', 'GB', 'TB', 'PB')  # PB is already way outside reasonnable range
+    size_string_re: re.Pattern = re.compile(r'^([0-9]+(?:\.[0-9]+)?)([KMGTP]?B)$', re.I)
+
+    def size_from_string(self, size_string: str) -> int | None:
+        """Convert string representation of an image size to a bytes count."""
+        match = self.size_string_re.match(size_string.strip())
+        if not match:
+            return None
+        size = float(match.group(1))
+        scale = match.group(2).upper()
+        return int(size * (1000 ** self.size_scales.index(scale)))
 
     def run(self, command_args: Iterable[str], **kwargs) -> subprocess.CompletedProcess:
         """Run the docker command.
@@ -215,7 +261,7 @@ class DockerCli(Docker):
                 tags_to_images[tag] = image_id
             images[image_id].image_id = image_id
             images[image_id].tags.add(tag)
-            images[image_id].size = size
+            images[image_id].size = self.size_from_string(size)
         return dict(images), tags_to_images
 
 
@@ -248,27 +294,9 @@ class DockerPackage(Docker):
     Implementation using the docker package.
     """
 
-    _human_bytes_units = ['B', 'kB', 'MB', 'GB', 'TB', 'PB']
-
     def __init__(self):
         """Initialize docker client."""
         self._client = docker.from_env()
-
-    def human_bytes(self, size: int) -> str:
-        """Convert numeric size to human-readable value."""
-        scale = 0
-        while size > 1000:
-            scale += 1
-            size = size / 1000.0
-        if size < 0 or scale >= len(self._human_bytes_units):
-            return '???'
-        unit = self._human_bytes_units[scale]
-        if size >= 100:
-            return f"{int(size)}{unit}"
-        elif size >= 10:
-            return f"{size:.01f}{unit}"
-        else:
-            return f"{size:.02f}{unit}"
 
     def get_images(self) -> Docker.ImagesData:
         """Get images list."""
@@ -277,7 +305,7 @@ class DockerPackage(Docker):
         for image in self._client.images.list():
             short_id = image.short_id.rpartition(':')[2]
             images[short_id].id = short_id
-            images[short_id].size = self.human_bytes(image.attrs.get('Size', -1))
+            images[short_id].size = image.attrs.get('Size')
             images[short_id].tags.update(image.tags or ['<untagged>'])
             images[short_id].layers = image.attrs['RootFS']['Layers']
             for tag in image.tags:
@@ -420,21 +448,24 @@ class DockerTree:
 
 
     def collect_lines(self, images: dict[str, ImageDict] | None, colors: ColorTheme | None,
-                      max_tag_length: int = 0, max_depth: int = 0,
-                      depth: int = 0, prefix: str = '', hl: set[re.Pattern] | None = None) -> list[str]:
+                      max_tag_length: int = 0, max_depth: int = 0, depth: int = 0, prefix: str = '',
+                      hl: set[re.Pattern] | None = None, sort: str = 'tags', reverse: bool = False) -> list[str]:
         """Collect infos lines."""
         if images is None:
             return []
         lines = []
         count = len(images)
-        images_iter = sorted(images.items(), key=lambda item: min(item[1].tags or {''}))
+        if sort == 'size':
+            images_iter = sorted(images.items(), key=lambda item: item[1].sort_size, reverse=reverse)
+        else:
+            images_iter = sorted(images.items(), key=lambda item: min(item[1].tags or {''}), reverse=reverse)
 
         for index, (image_id, data) in enumerate(images_iter, start=1):
-            tags = sorted(data.tags)
+            tags = data.sorted_tags(reverse=reverse)
             is_last = index == count
             mark = ('\u250c' if (index == 1 and depth == 0) else ('\u2514' if is_last else '\u251C')) + ('\u2500' * 2)
             tag_prefix = '\u2502  ' if not is_last else '   '
-            self._add_line(lines, colors, prefix, mark, image_id[:12], data.size, tags[0], data.containers,
+            self._add_line(lines, colors, prefix, mark, image_id[:12], data.human_size, tags[0], data.containers,
                            max_tag_length, max_depth, depth, hl=hl)
             for tag in tags[1:]:
                 children_mark = '\u2502' if data.children else ''
@@ -442,12 +473,12 @@ class DockerTree:
                                max_tag_length, max_depth, depth, hl=hl)
             nested_prefix = prefix + ('    ' if is_last else '\u2502   ')
             children_lines = self.collect_lines(data.children, colors, max_tag_length, max_depth, depth + 1,
-                                                nested_prefix, hl=hl)
+                                                nested_prefix, hl=hl, sort=sort, reverse=reverse)
             lines.extend(children_lines)
         return lines
 
 
-    def print_tree(self, highlights: set[re.Pattern] | None = None):
+    def print_tree(self, highlights: set[re.Pattern] | None = None, sort: str = 'tags', reverse: bool = False):
         """Print infos for given images dict."""
         images, max_depth, max_tag_length = self.build_tree(4)
         colors = ColorTheme()
@@ -455,7 +486,7 @@ class DockerTree:
             colors.disable_colors()
         head_lines = []
         self._add_line(head_lines, None, '', '   ', 'Image Id', 'Size', 'Tags', 'Containers', max_tag_length, max_depth)
-        lines = self.collect_lines(images, colors, max_tag_length, max_depth, hl=highlights)
+        lines = self.collect_lines(images, colors, max_tag_length, max_depth, hl=highlights, sort=sort, reverse=reverse)
         delim_line = "-" * max(len(colors.colorless(line)) for line in head_lines + lines)
         head_lines.append(delim_line)
         for line in head_lines + lines:
@@ -475,11 +506,16 @@ def _main_cli():
     """Parse command line and print images tree."""
     from argparse import ArgumentParser
     parser = ArgumentParser()
-    parser.add_argument('highlights', nargs='*')
+    parser.add_argument('highlights', nargs='*',
+                        help="Regular expressions to highlight matching ids, tags or container names.")
+    parser.add_argument('--size', '-s', dest='sort', action='store_const', const='size', default='tags',
+                        help="Sort images by size")
+    parser.add_argument('--reverse', '-r', dest='reverse', action='store_true',
+                        help="Reverse images sort order")
     options = parser.parse_args()
     highlights = set(re.compile(pat, re.I) for pat in options.highlights)
     docker_tree = DockerTree()
-    docker_tree.print_tree(highlights)
+    docker_tree.print_tree(highlights, options.sort, options.reverse)
 
 
 if __name__ == '__main__':
