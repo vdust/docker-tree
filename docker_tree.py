@@ -96,12 +96,31 @@ class ImageInfos:
     """Image informations."""
     id: str | None = None
     size: int | None = None
+    net_size: int | None = None
     tags: set[str] = dataclasses.field(default_factory=set)
     containers: list[str] = dataclasses.field(default_factory=list)
     layers: list[str] = dataclasses.field(default_factory=list)
     children: dict[str, 'ImageInfos'] | None = None
 
     _human_bytes_units: ClassVar[list[str]] = ['B', 'kB', 'MB', 'GB', 'TB', 'PB']
+
+    @classmethod
+    def get_human_size(cls, size: int | None) -> str:
+        """Get size as a human-readable string."""
+        scale = 0
+        size = size if size is not None else -1
+        while size > 1000:
+            scale += 1
+            size = size / 1000.0
+        if size < 0 or scale >= len(cls._human_bytes_units):
+            return '???'
+        unit = cls._human_bytes_units[scale]
+        if size >= 100 or scale == 0:
+            return f"{int(size)}{unit}"
+        elif size >= 10:
+            return f"{size:.01f}{unit}"
+        else:
+            return f"{size:.02f}{unit}"
 
     @property
     def first_tag(self) -> str | None:
@@ -126,21 +145,27 @@ class ImageInfos:
     @property
     def human_size(self) -> str:
         """Convert image size to human-readable value."""
-        scale = 0
-        size = self.size if self.size is not None else -1
-        while size > 1000:
-            scale += 1
-            size = size / 1000.0
-        if size < 0 or scale >= len(self._human_bytes_units):
-            return '???'
-        unit = self._human_bytes_units[scale]
-        if size >= 100:
-            return f"{int(size)}{unit}"
-        elif size >= 10:
-            return f"{size:.01f}{unit}"
-        else:
-            return f"{size:.02f}{unit}"
+        return self.get_human_size(self.size)
 
+    @property
+    def human_net_size(self) -> str:
+        """Convert image size to human-readable value."""
+        if self.net_size is not None:
+            net = self.get_human_size(self.net_size)
+            if self.net_size is not None and self.net_size >= 0:
+                net = "+" + net
+            return net
+        else:
+            return ''
+
+    def update_net_sizes(self):
+        """Update net sizes of chidren images."""
+        if not self.children:
+            return
+        for child in self.children.values():
+            child.update_net_sizes()
+            if self.size is not None and child.size is not None:
+                child.net_size = child.size - self.size
 
 @dataclasses.dataclass
 class ColorTheme:
@@ -375,6 +400,8 @@ class DockerTree:
                 images[image_id].children = dict((child, images[child]) for child in images_children[image_id])
             if image_id not in all_children:
                 tree[image_id] = images[image_id]
+        for parent in tree.values():
+            parent.update_net_sizes()
         _walk = [(0, tree)]
         depth = 0
         max_tag_length = 0
@@ -416,8 +443,8 @@ class DockerTree:
 
 
     def _add_line(self, lines: list[str], colors: ColorTheme | None, prefix: str, mark: str, image_id: str, size: str,
-                  tag: str, containers: list[ContainerInfos] | str, max_tag_length: int, max_depth: int, depth: int = 0,
-                  hl: set[re.Pattern] | None = None):
+                  net_size: str, tag: str, containers: list[ContainerInfos] | str, max_tag_length: int, max_depth: int,
+                  depth: int = 0, hl: set[re.Pattern] | None = None):
         if isinstance(containers, str):
             tag_containers = containers
         else:
@@ -443,7 +470,9 @@ class DockerTree:
             c_clear = colors.clear
         else:
             c_image = c_tag = c_clear = ''
-        lines.append(f"{prefix}{mark} {c_image}{image_id:12}{c_clear}{offset}    {size:6}    "
+        if net_size:
+            net_size = f"({net_size})"
+        lines.append(f"{prefix}{mark} {c_image}{image_id:12}{c_clear}{offset}    {size:6} {net_size:9}   "
                      f"{prefix}{mark} {c_tag}{tag}{c_clear}    {tag_offset}{tag_containers}")
 
 
@@ -465,11 +494,11 @@ class DockerTree:
             is_last = index == count
             mark = ('\u250c' if (index == 1 and depth == 0) else ('\u2514' if is_last else '\u251C')) + ('\u2500' * 2)
             tag_prefix = '\u2502  ' if not is_last else '   '
-            self._add_line(lines, colors, prefix, mark, image_id[:12], data.human_size, tags[0], data.containers,
-                           max_tag_length, max_depth, depth, hl=hl)
+            self._add_line(lines, colors, prefix, mark, image_id[:12], data.human_size, data.human_net_size, tags[0],
+                           data.containers, max_tag_length, max_depth, depth, hl=hl)
             for tag in tags[1:]:
                 children_mark = '\u2502' if data.children else ''
-                self._add_line(lines, colors, prefix, tag_prefix, children_mark, '', tag, data.containers,
+                self._add_line(lines, colors, prefix, tag_prefix, children_mark, '', '', tag, data.containers,
                                max_tag_length, max_depth, depth, hl=hl)
             nested_prefix = prefix + ('    ' if is_last else '\u2502   ')
             children_lines = self.collect_lines(data.children, colors, max_tag_length, max_depth, depth + 1,
@@ -485,7 +514,8 @@ class DockerTree:
         if os.getenv('USECOLOR', 'no')[:1].lower() not in ('y', '1'):
             colors.disable_colors()
         head_lines = []
-        self._add_line(head_lines, None, '', '   ', 'Image Id', 'Size', 'Tags', 'Containers', max_tag_length, max_depth)
+        self._add_line(head_lines, None, '', '   ', 'Image Id', 'Size', 'Net', 'Tags', 'Containers',
+                       max_tag_length, max_depth)
         lines = self.collect_lines(images, colors, max_tag_length, max_depth, hl=highlights, sort=sort, reverse=reverse)
         delim_line = "-" * max(len(colors.colorless(line)) for line in head_lines + lines)
         head_lines.append(delim_line)
